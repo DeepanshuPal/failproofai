@@ -13,7 +13,20 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { INTEGRATION_TYPES } from "./types";
 import { PACK_COMMIT_RE, PACK_VERSION_RE } from "./pack-manifest";
 import { detectInstalledClis } from "./integrations";
-import { parsePackIdentity, parsePackPolicy, readInstalledPacks } from "./pack-manifest";
+import {
+  packParamsProblem,
+  parsePackIdentity,
+  parsePackPolicy,
+  parsePackSemanticPolicy,
+  readInstalledPacks,
+  type SemanticManifestEntry,
+} from "./pack-manifest";
+import { compareVersions, parseSemver } from "./semver-precedence";
+// The build step measures a pack's question set against the envelope's own
+// budget, which means reaching the semantic side. This is a CLI module — loaded
+// by `failproofai publish`, never by a hook — so the rule that keeps those
+// modules off an unconfigured machine's hook path does not apply here.
+import { BUILTIN_QUESTION_CHARS, MAX_PACK_QUESTION_CHARS, questionChars, semanticPoliciesFromPacks } from "./semantic/pack-policies";
 import {
   AmbiguousPackId,
   PACK_CHECKSUMS_ASSET,
@@ -27,10 +40,15 @@ import {
   removePack,
   setPackPolicyEnabled,
   slugifyCategory,
+  type PackPreview,
 } from "./pack-store";
 import type { PolicyEffect } from "./cloud-managed-policies";
 import { loadCustomHooks } from "./custom-hooks-loader";
-import type { MultiChoice, TTYIn, TTYOut } from "./tui";
+import { getSemanticRegistrations } from "./custom-hooks-registry";
+import { isFirstPartyPack, isReservedClaim, jevPacks } from "./effective-reviewers";
+import { authorityFieldsOf, authorityProblem, resolvePolicyAuthority } from "./policy-authority";
+import type { PolicyCatalogEntry, SemanticPolicyDeclaration } from "./policy-types";
+import type { MultiChoice, RenderOpts, TTYIn, TTYOut } from "./tui";
 import {
   chip,
   emptyState,
@@ -64,7 +82,19 @@ export interface PackBuildMeta {
   policies: number;
   defaultOn: number;
   commit?: string;
+  /** Jev checks and no regex half: `publish` repeats {@link JEV_ONLY_ROLLBACK_REMINDER}. */
+  semanticOnly?: boolean;
 }
+
+/**
+ * A build from before `semanticOnly` refuses such a pack as blanket-deny, so its
+ * author has to tell users. Shared by build's lines and publish's success
+ * message, which is the only one an author actually reads.
+ */
+const JEV_ONLY_ROLLBACK_REMINDER = [
+  "  Jev checks alone: tell users to remove it before rolling a machine back to an older failproofai,",
+  "  which can deny every tool call over a pack it will not load (see the publish-a-pack docs).",
+];
 
 const ok = (lines: string[], meta?: PackBuildMeta): PackCliResult => ({
   lines,
@@ -73,12 +103,30 @@ const ok = (lines: string[], meta?: PackBuildMeta): PackCliResult => ({
 });
 const fail = (lines: string[]): PackCliResult => ({ lines, exitCode: 1 });
 
-function parseList(rest: string[], flag: string): string[] | undefined {
-  const idx = rest.findIndex((a) => a === flag || a.startsWith(`${flag}=`));
-  if (idx === -1) return undefined;
-  const raw = rest[idx].includes("=") ? rest[idx].split("=").slice(1).join("=") : rest[idx + 1];
-  if (!raw || raw.startsWith("--")) return [];
-  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+/**
+ * The first failproofai that runs a pack's Jev checks as published: 1.0.7
+ * ignores `semantic` (and `minCliVersion`), and 1.0.7-beta.x replaces the
+ * built-in checks with a pack's. A pack with checks is held to at least this.
+ */
+const JEV_PACK_MIN_CLI = "1.0.8-beta.0";
+
+/**
+ * Every occurrence of any of `flags`, comma-split and de-duplicated: a repeated
+ * flag adds to the list rather than being silently dropped. `[]` when any
+ * occurrence has no value (callers refuse that), undefined when none appears.
+ */
+function parseList(rest: string[], ...flags: string[]): string[] | undefined {
+  let found = false;
+  const out: string[] = [];
+  for (let i = 0; i < rest.length; i += 1) {
+    const flag = flags.find((f) => rest[i] === f || rest[i].startsWith(`${f}=`));
+    if (!flag) continue;
+    found = true;
+    const raw = rest[i] === flag ? rest[i + 1] : rest[i].slice(flag.length + 1);
+    if (!raw || raw.startsWith("--")) return [];
+    out.push(...raw.split(",").map((s) => s.trim()).filter(Boolean));
+  }
+  return found ? [...new Set(out)] : undefined;
 }
 
 /**
@@ -168,17 +216,25 @@ export function packAddSource(rest: string[]): string | undefined {
  * a third would be the one that drifts.
  */
 function parseCliList(rest: string[]): { clis?: string[] } | { error: string[] } {
-  const idx = rest.findIndex((a) => a === "--cli" || a.startsWith("--cli="));
-  if (idx === -1) return {};
+  // Every `--cli`, not just the first: a repeat adds agents. One that names
+  // none still refuses the whole selection, below.
   const values: string[] = [];
-  if (rest[idx].startsWith("--cli=")) {
-    values.push(...rest[idx].slice("--cli=".length).split(","));
-  } else {
-    for (let j = idx + 1; j < rest.length && looksLikeCliName(rest[j]); j += 1) {
-      values.push(...rest[j].split(","));
-    }
+  let found = false;
+  let emptyOccurrence = false;
+  for (let i = 0; i < rest.length; i += 1) {
+    const before = values.length;
+    if (rest[i].startsWith("--cli=")) {
+      values.push(...rest[i].slice("--cli=".length).split(",").filter((v) => v.trim()));
+    } else if (rest[i] === "--cli") {
+      for (let j = i + 1; j < rest.length && looksLikeCliName(rest[j]); j += 1) {
+        values.push(...rest[j].split(",").filter((v) => v.trim()));
+      }
+    } else continue;
+    found = true;
+    if (values.length === before) emptyOccurrence = true;
   }
-  const names = values.map((v) => v.trim()).filter(Boolean);
+  if (!found) return {};
+  const names = emptyOccurrence ? [] : [...new Set(values.map((v) => v.trim()))];
   // `--cli` with nothing after it is a typo, not a scope.
   //
   // It used to become `clis: []`, which `installed.json` stores verbatim and
@@ -238,7 +294,7 @@ function selectionFrom(rest: string[]): {
 } {
   // `--policy` reads right for one ("give me this policy"), `--only` for a set.
   // They are the same switch; taking both means neither is the wrong guess.
-  const only = parseList(rest, "--policy") ?? parseList(rest, "--only");
+  const only = parseList(rest, "--policy", "--only");
   const categories = parseList(rest, "--category");
   const parsedClis = parseCliList(rest);
   if ("error" in parsedClis) return { error: parsedClis.error };
@@ -294,12 +350,27 @@ async function build(rest: string[]): Promise<PackCliResult> {
   const version = flag("version");
   const commit = flag("commit");
   const effect = flag("effect") ?? "enforce";
+  const minCliVersion = flag("min-cli-version");
   const outDir = resolve(flag("out") ?? "dist-pack");
+  // Where it will be installed from, which is what a machine judges a pack by
+  // (`isFirstPartyPack` reads `source`, never the id). `publish` passes its
+  // repository; `pack build` has only the id to go on.
+  const repo = flag("repo");
 
   if (!entry || !id || !version) {
     return fail([
       "Usage: failproofai publish <entry.mjs> --repo <owner>/<repo> --version <version>",
-      "       [--out <dir>] [--effect enforce|observe]",
+      "       [--out <dir>] [--effect enforce|observe] [--min-cli-version <version>]",
+    ]);
+  }
+  // Refused here rather than written and refused by every machine that installs
+  // it. A `minCliVersion` nobody can order is a requirement nobody can check,
+  // and the loader treats one as grounds to refuse the whole pack — so a typo
+  // published here is a pack that installs nowhere.
+  if (minCliVersion !== undefined && parseSemver(minCliVersion) === null) {
+    return fail([
+      `--min-cli-version ${JSON.stringify(minCliVersion)} is not a version that can be compared.`,
+      "It must be plain semver — 1.0.7, or 1.0.7-beta.0 for a pre-release.",
     ]);
   }
   let identity: { id: string; version: string; effect: PolicyEffect; commit?: string };
@@ -315,24 +386,34 @@ async function build(rest: string[]): Promise<PackCliResult> {
   // Refused rather than bundled: see the note above. A relative specifier is the
   // only kind that would be rewritten by the loader and left outside the digest.
   const source = readFileSync(entryPath, "utf8");
-  const localImport = /(?:^|\n)\s*(?:import|export)[^;\n]*from\s+["'](\.[^"']*)["']/.exec(source);
+  const localImport = firstRelativeSpecifier(source);
   if (localImport) {
     return fail([
-      `${entryPath} imports ${localImport[1]}, and only the entry file is digest-pinned.`,
+      `${entryPath} imports ${localImport}, and only the entry file is digest-pinned.`,
       "Bundle it to a single file first (esbuild, bun build, rollup), then build the pack from that.",
     ]);
   }
 
   let hooks;
+  let semanticDeclarations: SemanticPolicyDeclaration[];
   try {
     hooks = await loadCustomHooks(entryPath, { strict: true });
+    // Read AFTER the load, from the same registration pass `clearCustomHooks`
+    // resets: a semantic policy has no `fn`, so it never travels back through
+    // `loadCustomHooks`'s return value.
+    semanticDeclarations = [...getSemanticRegistrations()];
   } catch (err) {
     return fail([`Could not load ${entryPath}: ${err instanceof Error ? err.message : String(err)}`]);
   }
-  if (hooks.length === 0) {
+  // BOTH registries, or a pack that ships only Jev questions — a legitimate
+  // thing to publish, since the regex floor may already be somebody else's pack
+  // — is refused for registering nothing.
+  if (hooks.length === 0 && semanticDeclarations.length === 0) {
     return fail([
       `${entryPath} registered no policies.`,
-      "A pack entry calls customPolicies.add({ name, description, match, fn }) for each one.",
+      "A pack entry calls customPolicies.add({ name, description, match, fn }) for each one,",
+      "and semanticPolicies.add({ name, title, appliesTo, mode, userCanOverride, probes, guidance })",
+      "for each Jev question set.",
     ]);
   }
 
@@ -359,6 +440,98 @@ async function build(rest: string[]): Promise<PackCliResult> {
     ]);
   }
 
+  // The pack's Jev question sets, validated with the LOADER's own rules — the
+  // same deal `parsePackPolicy` gets above, so a semantic policy that could
+  // never load fails here, where the author can fix it.
+  const semantic: SemanticManifestEntry[] = [];
+  const packSource = { source: `github:${repo ?? identity.id}` };
+  for (const [index, declaration] of semanticDeclarations.entries()) {
+    try {
+      const parsed = parsePackSemanticPolicy(identity.id, declaration, index);
+      // Same reason two regex policies cannot share a name, one layer over: the
+      // answer map is keyed `<policy>.<probe>`, so a duplicate would overwrite
+      // the first policy's questions in the compiled request.
+      if (semantic.some((s) => s.name === parsed.name)) {
+        throw new Error(`two semantic policies are called ${JSON.stringify(parsed.name)}`);
+      }
+      // The loader's own rule: a built-in check name from anyone but FailproofAI
+      // is void on every machine, never asked and never a reviewer.
+      if (isReservedClaim(packSource, parsed.name)) {
+        throw new Error(
+          `${JSON.stringify(parsed.name)} is a name reserved for FailproofAI's own Jev checks, so a pack from ` +
+            `${repo ?? identity.id} would never have it asked. Pick a name of your own.`,
+        );
+      }
+      semantic.push(parsed);
+    } catch (err) {
+      return fail([err instanceof Error ? err.message : String(err)]);
+    }
+  }
+
+  // A pack with Jev checks needs a build that runs them, so its minimum is at
+  // least the first one — written when the author gave none, refused when lower.
+  if (semantic.length > 0 && minCliVersion !== undefined && (compareVersions(minCliVersion, JEV_PACK_MIN_CLI) ?? 0) < 0) {
+    return fail([
+      `--min-cli-version ${minCliVersion} is older than the first failproofai that runs a pack's Jev checks (${JEV_PACK_MIN_CLI}):`,
+      "1.0.7 ignores them, and 1.0.7-beta.x replaces the built-in checks with them.",
+      `Pass --min-cli-version ${JEV_PACK_MIN_CLI} or newer, or leave it out and ${JEV_PACK_MIN_CLI} is written.`,
+    ]);
+  }
+  const requiredCli = semantic.length > 0 ? (minCliVersion ?? JEV_PACK_MIN_CLI) : minCliVersion;
+
+  // The question budget, checked against what one Jev request can carry. A pack
+  // over it installs and then has its overflow policies dropped one by one on
+  // the user's machine, in manifest order — a pack that enforces less than it
+  // says, which is the failure this whole lane is built to avoid.
+  //
+  // A pack from outside FailproofAI is ADDED to the built-in checks, which every
+  // machine spends the budget on first (`semanticPoliciesFromPacks`), so it gets
+  // only what they leave.
+  const questionCost = semantic.reduce((total, entry) => total + questionChars(entry), 0);
+  const firstParty = isFirstPartyPack(packSource);
+  const questionBudget = MAX_PACK_QUESTION_CHARS - (firstParty ? 0 : BUILTIN_QUESTION_CHARS);
+  if (questionCost > questionBudget) {
+    return fail([
+      `This pack's ${semantic.length} semantic policies compile to ${questionCost} characters of questions, ` +
+        (firstParty
+          ? `over the ${MAX_PACK_QUESTION_CHARS} one Jev request has room for.`
+          : `over the ${questionBudget} a machine leaves a pack from outside FailproofAI: one Jev request has room ` +
+            `for ${MAX_PACK_QUESTION_CHARS}, and the 16 built-in checks every machine asks take ${BUILTIN_QUESTION_CHARS} of it first.`),
+      "Shorten the probe instructions and criteria, or ship fewer policies per pack.",
+    ]);
+  }
+
+  // An authority declaration the manifest would lose, or that registration
+  // would quietly downgrade to hard, is refused HERE. Every machine that
+  // installs the pack would otherwise make the policy hard with only a warning
+  // in its own log — the author's decision, silently not taking effect — while
+  // at build time nothing is installed yet and refusing costs nobody anything.
+  // The same rule `scripts/build-policy-pack.mjs` applies to the core pack.
+  //
+  // Judged against the reviewers the PACK SHIPS WITH, not this build's: a pack
+  // that carries both tiers replaces the compiled semantic set on every machine
+  // that installs it, so `reviewedBy: ["its-own-check"]` is exactly right and
+  // the builtin list would call it a name "this build does not have". A pack
+  // with no semantic entries still answers to the builtin set, which is what its
+  // machines will be running.
+  const reviewers = semantic.length > 0 ? new Set(semantic.map((s) => s.name)) : undefined;
+  const authorityProblems = hooks.flatMap((hook) => {
+    const problem = authorityProblem({ authority: hook.authority, reviewedBy: hook.reviewedBy }, reviewers);
+    return problem ? [`  ${hook.name}: ${problem}`] : [];
+  });
+  if (authorityProblems.length > 0) {
+    return fail([
+      authorityProblems.length === 1
+        ? "One policy declares an authority this build cannot publish:"
+        : `${authorityProblems.length} policies declare an authority this build cannot publish:`,
+      ...authorityProblems,
+      ...(reviewers
+        ? ["This pack declares Jev checks of its own, so reviewedBy may name only those."]
+        : []),
+      'Fix the declaration, or leave authority out and the policy is "hard". See https://docs.befailproof.ai/policies/authority',
+    ]);
+  }
+
   const policies: unknown[] = [];
   for (const [index, hook] of hooks.entries()) {
     // `category` and `defaultEnabled` are pack-manifest fields a plain custom
@@ -367,13 +540,41 @@ async function build(rest: string[]): Promise<PackCliResult> {
     // FALSE: a pack's declared defaults are what `pack add` switches on with no
     // flags, and switching on a stranger's every policy unattended is the
     // installer opinion this lane already refused once.
-    const extra = hook as unknown as { category?: unknown; defaultEnabled?: unknown };
+    const extra = hook as unknown as {
+      category?: unknown; defaultEnabled?: unknown; params?: unknown; alwaysOn?: unknown;
+    };
+    // `params` is read off the registration for the same reason, and leaving it
+    // out was not cosmetic: `registerPolicy` takes a pack policy's schema from the
+    // MANIFEST by name, so a pack published without it evaluates every one of its
+    // policies with `ctx.params = {}` — which discards the user's own configured
+    // values too, not just the defaults. Of the 39 builtins, 20 carry a schema:
+    // `prefer-package-manager` would have been inert, and `block-sudo`'s
+    // `allowPatterns`, `block-rm-rf`'s and `block-read-outside-cwd`'s `allowPaths`
+    // would all have stopped working — every one of them failing silently
+    // STRICTER, which is the direction users work around instead of reporting.
+    const paramsProblem = packParamsProblem(extra.params);
+    if (paramsProblem) {
+      return fail([
+        `${hook.name} declares a params schema this build cannot publish: ${paramsProblem}`,
+        "A machine reads the schema from the manifest, so an unusable one is a policy",
+        "that quietly runs without its parameters. Fix the declaration, or leave params out.",
+      ]);
+    }
     const candidate = {
       name: hook.name,
       description: hook.description ?? "",
       category: typeof extra.category === "string" && extra.category ? extra.category : "General",
       defaultEnabled: extra.defaultEnabled === true,
       match: hook.match ?? {},
+      ...(extra.params !== undefined ? { params: extra.params } : {}),
+      // Carried so parsePackPolicy refuses it as the loader would; left off, an
+      // alwaysOn registration published as an ordinary (even reviewable) policy.
+      ...("alwaysOn" in extra ? { alwaysOn: extra.alwaysOn } : {}),
+      // Whether Jev may clear this policy's verdict. A pack's MANIFEST is what
+      // a machine reads it from, so a declaration left on the registration
+      // alone would be published as nothing — silently hard. Checked above, so
+      // everything declared here is shape-valid; absent stays absent.
+      ...authorityFieldsOf(hook as unknown as Record<string, unknown>),
     };
     try {
       policies.push(parsePackPolicy(identity.id, candidate, index));
@@ -386,14 +587,21 @@ async function build(rest: string[]): Promise<PackCliResult> {
   // The manifest is hashed and the hash is the pin, so every byte in here is
   // part of what a machine verifies — a field carrying "there was nothing to
   // say" earns none of that cost. Readers already treat absence as ordinary.
+  //
+  // `minCliVersion` and `semantic` follow the same rule, and for `semantic` it is
+  // load-bearing rather than tidy: an EMPTY array would still be "a pack that
+  // declares semantic entries" to a careless reader, and the replacement rule
+  // turns that into "this pack replaced the compiled-in set with nothing".
   const manifest =
     JSON.stringify(
       {
         id: identity.id,
         version: identity.version,
+        ...(requiredCli ? { minCliVersion: requiredCli } : {}),
         effect: identity.effect,
         ...(identity.commit ? { commit: identity.commit } : {}),
         policies,
+        ...(semantic.length > 0 ? { semantic } : {}),
       },
       null,
       2,
@@ -411,15 +619,35 @@ async function build(rest: string[]): Promise<PackCliResult> {
   );
 
   const on = policies.filter((p) => (p as { defaultEnabled?: boolean }).defaultEnabled).length;
+  const semanticOnly = policies.length === 0 && semantic.length > 0;
   return ok([
     `Built ${identity.id}@${identity.version} — ${policies.length} policies, ${on} on by default.`,
+    // Said separately, and said at all, because this half changes what Jev asks
+    // on every machine that installs the pack. An author who did not mean to
+    // ship it should find that out here.
+    ...(semantic.length > 0
+      ? [
+          `  ${semantic.length} semantic ${semantic.length === 1 ? "policy" : "policies"} for Jev ` +
+            `(${questionCost} characters of questions), ` +
+            (identity.effect === "observe"
+              ? "not asked where it installs: Jev asks only the checks of packs that enforce."
+              : `${firstParty ? "replacing" : "added to"} the built-in checks where it installs.`),
+        ]
+      : []),
+    ...(requiredCli ? [`  Requires failproofai ${requiredCli} or newer.`] : []),
+    ...(semanticOnly ? JEV_ONLY_ROLLBACK_REMINDER : []),
     `  ${outDir}/${PACK_MANIFEST_ASSET}`,
     `  ${outDir}/${PACK_ENTRY_ASSET}`,
     `  ${outDir}/${PACK_CHECKSUMS_ASSET}`,
     "",
     `Publish: attach all three to a GitHub release tagged ${identity.version}, then anyone runs:`,
     `  failproofai policies add <owner>/<repo>`,
-  ], { policies: policies.length, defaultOn: on, ...(identity.commit ? { commit: identity.commit } : {}) });
+  ], {
+    policies: policies.length,
+    defaultOn: on,
+    ...(identity.commit ? { commit: identity.commit } : {}),
+    ...(semanticOnly ? { semanticOnly } : {}),
+  });
 }
 
 /**
@@ -999,7 +1227,13 @@ function inferTaggedVersion(entryPath: string, sources?: string[]): string | nul
  * Identified by CONTENT, not by filename. A name convention would either miss
  * `guards.mjs` or match an unrelated `policies.mjs` that configures something
  * else entirely; a file that imports `failproofai` and calls
- * `customPolicies.add` is a policy file whatever it is called.
+ * `customPolicies.add` — or `semanticPolicies.add` — is a policy file whatever
+ * it is called.
+ *
+ * Both registries count, and leaving one out was not a cosmetic gap: a file that
+ * registers only Jev questions was undiscoverable, so `failproofai publish` in
+ * its own directory reported no policy file at all rather than reaching the
+ * "registered no policies" check and explaining itself.
  *
  * Returns ALL of them. Splitting policies across files is the normal thing to
  * do past about three, and they are one pack — so several files is an answer,
@@ -1008,8 +1242,11 @@ function inferTaggedVersion(entryPath: string, sources?: string[]): string | nul
  *
  * Non-recursive on purpose. Walking the tree finds fixtures, examples and
  * anything vendored, and publishing those is the failure this avoids.
+ *
+ * Takes the directory rather than reading `process.cwd()` so the discovery rule
+ * can be tested against a real folder without a `chdir`.
  */
-function findEntry(dir: string): string[] {
+export function findEntry(dir: string): string[] {
   let names: string[];
   try {
     names = readdirSync(dir);
@@ -1025,7 +1262,10 @@ function findEntry(dir: string): string[] {
       // would be the expensive half of this scan.
       if (statSync(full).size > 512 * 1024) continue;
       const text = readFileSync(full, "utf8");
-      if (/from\s+["']failproofai["']/.test(text) && /customPolicies\s*\.\s*add\s*\(/.test(text)) {
+      if (
+        /from\s+["']failproofai["']/.test(text) &&
+        /(?:customPolicies|semanticPolicies)\s*\.\s*add\s*\(/.test(text)
+      ) {
         found.push(full);
       }
     } catch {
@@ -1727,8 +1967,46 @@ function bundleEntry(
  */
 const PUBLISH_VALUE_FLAGS = new Set([
   "--repo", "--version", "--id", "--tag", "--notes", "--out", "--effect", "--entry", "--init",
-  "--commit",
+  "--commit", "--min-cli-version",
 ]);
+/**
+ * The first relative specifier an entry imports, or null.
+ *
+ * Two callers read this and they must agree, because between them they are the
+ * only two outcomes: `publish` bundles a multi-file entry into the one artifact
+ * a pack has to be, and `build` REFUSES one, since only the entry file is
+ * digest-pinned. A shape that neither recognises gets bundled by neither and
+ * refused by neither, and the author sees whatever the loader's rewrite makes of
+ * it — which is an esbuild parse error naming a token, not a file.
+ *
+ * Both sites previously used `[^;\n]*` between `import` and `from`, which cannot
+ * cross a newline and requires a `from` clause to exist. So both missed:
+ *
+ *   import "./policies/regex"        // side-effect only: there is no `from`
+ *   import {
+ *     aLongList,
+ *   } from "./shared"                // the `from` is on another line
+ *
+ * and a pack entry written either way — the natural way to write one whose
+ * halves register at module scope — failed to publish with `Expected "from" but
+ * found "{"`. Now `[^;]*?` spans newlines and stops at a statement end, and the
+ * bare form is matched on its own. Over-reaching to a later `from` is harmless:
+ * the answer is only ever used as "is there a relative import, and name one".
+ */
+export function firstRelativeSpecifier(source: string): string | null {
+  const patterns = [
+    /(?:^|\n)\s*(?:import|export)\b[^;]*?\bfrom\s*["'](\.[^"']*)["']/,
+    /(?:^|\n)\s*import\s*["'](\.[^"']*)["']/,
+    /\bimport\s*\(\s*["'](\.[^"']*)["']\s*\)/,
+    /\brequire\s*\(\s*["'](\.[^"']*)["']\s*\)/,
+  ];
+  for (const re of patterns) {
+    const m = re.exec(source);
+    if (m) return m[1];
+  }
+  return null;
+}
+
 function publishEntryArg(rest: string[]): string | undefined {
   const consumed = new Set<number>();
   for (let i = 0; i < rest.length; i += 1) {
@@ -2106,10 +2384,7 @@ async function publish(rest: string[]): Promise<PackCliResult> {
   // a bundler for a step this tool already performs for its own pack.
   let entryToBuild = entry;
   const needsBundle =
-    discovered.length > 1 ||
-    /(?:^|\n)\s*(?:import|export)[^;\n]*from\s+["']\.[^"']*["']/.test(
-      readFileSync(entry, "utf8"),
-    );
+    discovered.length > 1 || firstRelativeSpecifier(readFileSync(entry, "utf8")) !== null;
   if (needsBundle) {
     const sources = discovered.length > 1 ? discovered : [entry];
     const bundled = bundleEntry(sources, outDirEarly);
@@ -2120,6 +2395,7 @@ async function publish(rest: string[]): Promise<PackCliResult> {
   const built = await build([
     entryToBuild,
     "--id", id,
+    ...(repo ? ["--repo", repo] : []),
     "--version", version,
     // NOT when the tree is dirty, even though `--version` let the publish
     // through. `commit` claims these bytes came from that commit, and on a
@@ -2129,6 +2405,7 @@ async function publish(rest: string[]): Promise<PackCliResult> {
     ...(provenance && !provenance.dirty ? ["--commit", provenance.sha] : []),
     ...outFlagFrom(rest),
     ...effectFlagFrom(rest),
+    ...minCliVersionFlagFrom(rest),
   ]);
   if (built.exitCode !== 0) return built;
 
@@ -2143,7 +2420,9 @@ async function publish(rest: string[]): Promise<PackCliResult> {
       ...gitLines,
       ...(gitLines.length ? [""] : []),
       ...bundleNote,
-      ...built.lines.slice(0, 4),
+      // Everything above build's blank line: a fixed count cut the rollback
+      // reminder mid-sentence and dropped the asset paths.
+      ...built.lines.slice(0, built.lines.indexOf("")),
       "",
       ...(repo
         ? ["Dry run — nothing was published.", `Drop --dry-run to release it on ${repo}.`]
@@ -2259,6 +2538,7 @@ async function publish(rest: string[]): Promise<PackCliResult> {
     `Published ${id}@${version} to ${repo} at tag ${tag}.` +
       (versionFromSha ? " That names the commit it was built from." : ""),
     `  ${assets.length} assets attached`,
+    ...(built.meta?.semanticOnly ? JEV_ONLY_ROLLBACK_REMINDER : []),
     "",
     // The install lines are the whole point of the success message, and on a
     // private repository they are a lie — `policies add` 404s there. Print the
@@ -2289,6 +2569,18 @@ function outFlagFrom(rest: string[]): string[] {
 }
 function effectFlagFrom(rest: string[]): string[] {
   const i = rest.findIndex((a) => a === "--effect" || a.startsWith("--effect="));
+  if (i === -1) return [];
+  return rest[i].includes("=") ? [rest[i]] : [rest[i], rest[i + 1]];
+}
+/**
+ * Same again for `--min-cli-version`, and it has to be forwarded explicitly
+ * because `publish` hands `build` a list it assembles rather than its own
+ * `rest`. Left off, the flag parsed, validated, refused an uncomparable value —
+ * and then never reached the manifest, so the field the whole ordering
+ * constraint rests on was silently absent from the published artifact.
+ */
+function minCliVersionFlagFrom(rest: string[]): string[] {
+  const i = rest.findIndex((a) => a === "--min-cli-version" || a.startsWith("--min-cli-version="));
   if (i === -1) return [];
   return rest[i].includes("=") ? [rest[i]] : [rest[i], rest[i + 1]];
 }
@@ -2345,11 +2637,65 @@ async function pickClis(
  * Returns null when the user cancelled, which must not be confused with an
  * empty selection: one means "install nothing", the other means "do nothing".
  */
+/**
+ * How a pack's semantic half is named to a person: "3 Jev checks", never "3
+ * semantic policies".
+ *
+ * They are not policies in the sense every other number on these screens uses —
+ * nothing switches them on or off, `--policy` cannot name one, and they do not
+ * appear in `failproofai policies`. Calling them policies would make every count
+ * beside them read as the same kind of thing.
+ */
+function semanticPhrase(count: number): string {
+  return `${count} Jev ${count === 1 ? "check" : "checks"}`;
+}
+
+/**
+ * How a pack's Jev checks sit beside this build's, for add, show and the
+ * picker alike: a FailproofAI pack's replace them, anyone else's are added
+ * (`replacesBuiltinChecks`), and only where `jevPacks` lets the pack take part —
+ * never for an observe pack, only for its agents when scoped. One phrase, so
+ * the three cannot drift apart again.
+ */
+function besideBuiltinChecks(pack: { source?: string; effect?: PolicyEffect; clis?: string[] | null }): string {
+  if (jevPacks([{ effect: pack.effect ?? "enforce", clis: null }]).length === 0) {
+    return "not asked: this pack only observes, and Jev asks only the checks of packs that enforce";
+  }
+  const how = isFirstPartyPack(pack) ? "replacing this build's own set" : "added to this build's own checks";
+  return pack.clis && pack.clis.length > 0 ? `${how}, for ${pack.clis.join(", ")} only` : how;
+}
+
+/**
+ * Which of a pack's checks the resolver would leave out beside what is
+ * installed (the shared budget, a reserved or contested name). `preview` is a
+ * pack not installed yet, judged as if it were. A diagnostic: never throws.
+ */
+function jevCheckWarnings(id: string, preview?: PackPreview): string[] {
+  try {
+    const installed = readInstalledPacks().packs.filter((p) => p.id !== preview?.id);
+    const packs = preview ? [...installed, { ...preview, clis: null }] : installed;
+    return semanticPoliciesFromPacks(jevPacks(packs)).errors.filter((e) => e.includes(id));
+  } catch {
+    return [];
+  }
+}
+
 async function pickFromSource(
   source: string,
   io: { stdin: TTYIn; stdout: TTYOut },
 ): Promise<string[] | null> {
   const preview = await fetchPackPreview(source);
+  // Nothing to pick. A pack of Jev questions alone has no selectable policies —
+  // its semantic set is not switchable per entry — so the picker would draw an
+  // empty list and ask a question with no answers. `[]` rather than `null`: the
+  // user cancelled nothing, there was simply nothing to choose.
+  if (preview.policies.length === 0) {
+    io.stdout.write(
+      `\n  ${preview.id}@${preview.version} carries no selectable policies` +
+        `${preview.semantic.length > 0 ? `, only ${semanticPhrase(preview.semantic.length)}` : ""}.\n\n`,
+    );
+    return [];
+  }
   const categories = [...new Set(preview.policies.map((p) => p.category))];
   const rows: MultiChoice<string>[] = [];
   for (const category of categories) {
@@ -2364,6 +2710,15 @@ async function pickFromSource(
     }
   }
   const on = preview.policies.filter((p) => p.defaultEnabled).length;
+  // Said BEFORE the list, because the list cannot say it: a pack's Jev checks are
+  // not rows here, and they arrive whole. Somebody ticking boxes should know
+  // that is part of what they are agreeing to.
+  if (preview.semantic.length > 0) {
+    io.stdout.write(
+      `\n  This pack also brings ${semanticPhrase(preview.semantic.length)} (not selectable), ` +
+        `${besideBuiltinChecks(preview)}.\n  See: failproofai policies show ${source}\n\n`,
+    );
+  }
   const picked = await multiSelect<string>({
     message: `${preview.id}@${preview.version} — which of these should be on?`,
     choices: rows,
@@ -2463,7 +2818,7 @@ async function add(rest: string[]): Promise<PackCliResult> {
     ];
     const skipped = result.available.filter((n) => !result.enabled.includes(n));
 
-    // Say WHY this set is on. Without it, "10 of 38 enabled" reads like
+    // Say WHY this set is on. Without it, "10 of 39 enabled" reads like
     // something went wrong rather than like the pack's own recommendation.
     const why = {
       defaults: "the pack's defaults",
@@ -2480,9 +2835,34 @@ async function add(rest: string[]): Promise<PackCliResult> {
     // rendered as if something had gone missing.
     lines.push(
       result.enabled.length === 0
-        ? `  enabled (0/${result.available.length}, ${why}): none — the pack is installed and enforcing nothing`
+        ? // "enforcing nothing" is only true when the pack brought nothing else.
+          // A pack of Jev checks alone enforces through the semantic tier with no
+          // regex policy enabled at all, and telling that user their install does
+          // nothing is worse than saying nothing.
+          `  enabled (0/${result.available.length}, ${why}): none` +
+          (result.semantic > 0 ? "" : " — the pack is installed and enforcing nothing")
         : `  enabled (${result.enabled.length}/${result.available.length}, ${why}): ${summarise(result.enabled)}`,
     );
+    // Counted separately, and without an on/off ratio, because there is none:
+    // a pack's Jev checks arrive whole, and a FailproofAI pack's REPLACE the ones
+    // this build ships (anyone else's are added to them).
+    // Silence here was the shape of the original bug — the manifest's semantic
+    // half was fetched, verified and then never written to `installed.json`, so
+    // the half somebody installed did nothing and nothing said so.
+    if (result.semantic > 0) {
+      lines.push(
+        `  ${semanticPhrase(result.semantic)}, ${besideBuiltinChecks(result)}. ` +
+          "They apply only where you configured Jev (`failproofai jev status`).",
+      );
+    }
+    // Nothing after this screen says it: the record keeps no unreadable minimum.
+    if (result.minCliVersionNote) lines.push(`  ${result.minCliVersionNote}`);
+    // Which of its checks the resolver will leave out beside what is already
+    // installed (the shared question budget, a reserved or contested name).
+    // Otherwise said only in the hook log, on the first call that asks Jev.
+    if (result.semantic > 0) {
+      for (const e of jevCheckWarnings(result.id)) lines.push(`  ▲ ${e}`);
+    }
 
     if (skipped.length > 0) {
       lines.push(`  not enabled (${skipped.length}): ${summarise(skipped)}`);
@@ -2741,6 +3121,149 @@ function relativeAge(iso: string): string {
   return `${value} ${label}${value === 1 ? "" : "s"} ago`;
 }
 
+/**
+ * Which of a pack's OWN regex policies each of its Jev checks can clear, keyed
+ * by check name and empty for a check nothing names.
+ *
+ * INVERTED out of the same manifest's `reviewedBy` rather than declared beside
+ * the checks. A semantic entry says nothing about the policies that name it, so
+ * the only other way to show this column is a second list kept by hand — which
+ * is wrong the first time a publisher adds a reviewer to one policy, and wrong
+ * in the direction that overstates what Jev may clear.
+ *
+ * Judged with `resolvePolicyAuthority` against the pack's OWN check names,
+ * because that is the rule the installing machine applies: a pack declaring
+ * semantic entries replaces the compiled-in set (`effectiveReviewerNames`), so
+ * its `reviewedBy` may name only its own checks, and a declaration that names
+ * anything else — or one sitting under `authority: "hard"`, which a manifest may
+ * carry because the two fields are parsed independently — registers HARD. A
+ * policy in either state can never be cleared, so naming it under a check would
+ * promise a clear that cannot happen.
+ */
+function reviewersByCheck(
+  policies: ReadonlyArray<PolicyCatalogEntry>,
+  semantic: ReadonlyArray<SemanticManifestEntry>,
+): Map<string, string[]> {
+  const ownChecks = new Set(semantic.map((s) => s.name));
+  const byCheck = new Map<string, string[]>(semantic.map((s) => [s.name, []]));
+  for (const policy of policies) {
+    const { authority, reviewedBy } = resolvePolicyAuthority(policy, ownChecks);
+    if (authority !== "reviewable") continue;
+    for (const check of reviewedBy ?? []) byCheck.get(check)?.push(policy.name);
+  }
+  return byCheck;
+}
+
+/** Reviewers named in full. Past this the cell names two and counts the rest. */
+const REVIEWERS_LISTED = 3;
+
+/**
+ * A check's reviewers as one cell.
+ *
+ * The question a reader brings to this column is "can this check clear anything
+ * of mine", which two names and a count answer as well as ten do — and ten
+ * names in a cell push the column past the terminal, where `table` cuts one of
+ * them mid-word and the row stops being readable at all.
+ */
+function reviewersCell(names: ReadonlyArray<string>): string {
+  if (names.length <= REVIEWERS_LISTED) return names.join(", ");
+  return `${names.slice(0, 2).join(", ")}, +${names.length - 2}`;
+}
+
+/**
+ * Why a check that no policy names is in the pack at all — and the two answers
+ * are different facts, so the row has to tell them apart.
+ *
+ * A `deny` check with no reviewer is a concern the pack's regex half does not
+ * cover: it can only ever ADD a deny, never clear one, and that is a gap in the
+ * regex tier rather than a mistake in the manifest. An `instruct` check can
+ * never answer deny, so every conjunction naming it has one reachable outcome —
+ * a clear — which is why nothing names it and why nothing should (the
+ * `block-work-on-main` entry in CHANGELOG 1.0.7-beta.1 is that bug, shipped).
+ */
+function unreviewedCell(mode: SemanticManifestEntry["mode"], policies: number): string {
+  if (mode === "instruct") return "instruct-only — it can never deny";
+  // "the 38" borrows the count from the heading above, where it has just been
+  // read. The other two spellings exist because that sentence has no grammatical
+  // form at one or zero — and a pack of Jev checks alone, with no regex half at
+  // all, is a legitimate thing to publish.
+  if (policies === 0) return "this pack has no policies to clear";
+  if (policies === 1) return "the one policy here does not cover this";
+  return `nothing in the ${policies} covers this`;
+}
+
+/**
+ * A pack's Jev checks as a section of rows — the shape the category sections
+ * use, deliberately NOT their columns.
+ *
+ * It replaces a prose paragraph that listed sixteen names comma-separated above
+ * a screen where everything else was a scannable row. The rows are not policy
+ * rows and must not read as ones: there is no on/off chip, because nothing
+ * toggles a check, `--policy` cannot name one, and none of them appears in
+ * `failproofai policies`. What the columns carry instead is the pair of facts
+ * that decide what a check does on a real machine — its mode, and which of this
+ * pack's own policies it can clear.
+ *
+ * Null when the pack declares none, so a pack with no semantic half prints no
+ * section rather than an empty one.
+ */
+export function jevChecksSection(
+  pack: {
+    policies: ReadonlyArray<PolicyCatalogEntry>;
+    semantic: ReadonlyArray<SemanticManifestEntry>;
+    /** Where it is (or would be) installed from, which decides replace or add. */
+    source?: string;
+  },
+  opts?: RenderOpts,
+): string[] | null {
+  if (pack.semantic.length === 0) return null;
+  const reviewers = reviewersByCheck(pack.policies, pack.semantic);
+  const rows = pack.semantic.map((check) => {
+    const named = reviewers.get(check.name) ?? [];
+    // `reviews` and `—` lead the same cell rather than sitting in a column of
+    // their own. A fourth column would pad every `—` out to the width of
+    // `reviews`, which costs nine characters of the only column allowed to
+    // shrink — enough to ellipsize the reason on an 80-column terminal, where
+    // this way everything fits whole.
+    return [
+      check.mode,
+      check.name,
+      named.length > 0
+        ? `reviews  ${reviewersCell(named)}`
+        : `—  ${unreviewedCell(check.mode, pack.policies.length)}`,
+    ];
+  });
+  return [
+    // The count is on the heading rather than in a row, the way every other
+    // section on this screen carries its own total.
+    ...rule(
+      `Jev checks — ${pack.semantic.length} · not selectable · only where Jev is configured`,
+      opts,
+    ),
+    // The reviewers column is the only one allowed to shrink: a mode or a check
+    // name cut in half is a fact nobody can act on, while a cut reviewer list is
+    // one that was already abbreviated.
+    ...table({ head: ["", "", ""], rows, protect: [0, 1] }, opts),
+    "",
+    ...note(
+      "Nothing toggles them: `--policy` cannot name one and `failproofai policies` never lists them. " +
+        `They arrive whole, ${besideBuiltinChecks(pack)}.`,
+      opts,
+    ),
+    ...note(
+      // A pack of Jev checks alone has no regex half for the column to be about,
+      // so the sentence says what IS true of it rather than "its own 0 policies".
+      pack.policies.length === 0
+        ? "This pack ships no regex policies, so none of these checks clears anything here: a deny " +
+            "check can only ADD a deny, and an instruct check only ever warns."
+        : `\`reviews\` is which of this pack's own ${pack.policies.length} policies each check can clear. ` +
+            "A deny check that reviews nothing can only ever ADD a deny; an instruct check never answers " +
+            "deny, so nothing pairs with one.",
+      opts,
+    ),
+  ];
+}
+
 async function listRemote(source: string): Promise<PackCliResult> {
   const opts = optsFor(process.stdout);
   let preview;
@@ -2774,7 +3297,8 @@ async function listRemote(source: string): Promise<PackCliResult> {
     stack(
       title(
         `${preview.id}@${preview.version}`,
-        `${preview.policies.length} policies · ${categories.length} categories`,
+        `${preview.policies.length} policies · ${categories.length} categories` +
+          (preview.semantic.length > 0 ? ` · ${semanticPhrase(preview.semantic.length)}` : ""),
         opts,
       ),
       note(
@@ -2782,8 +3306,15 @@ async function listRemote(source: string): Promise<PackCliResult> {
           (preview.effect === "observe" ? " This pack OBSERVES — it records and blocks nothing." : ""),
         opts,
       ),
+      preview.minCliVersion ? note(`Requires failproofai ${preview.minCliVersion} or newer.`, opts) : null,
+      preview.minCliVersionNote ? note(preview.minCliVersionNote, opts) : null,
       preview.resolvedFromLatest ? note(`Newest release: ${preview.source}`, opts) : null,
       table({ head: ["", "", ""], rows }, opts),
+      // The half the table above cannot hold: its own section, under the
+      // policies rather than above them, because a check is read against the
+      // policies it can clear and those are the rows just passed.
+      jevChecksSection(preview, opts),
+      preview.semantic.length > 0 ? jevCheckWarnings(preview.id, preview).flatMap((e) => warning([e], opts)) : null,
       nextStep(`failproofai policies add ${source}`, "Install the defaults with:", opts),
       note("Or take part of it: --policy <a,b>, --category <x,y>, --all", opts),
     ),
